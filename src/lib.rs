@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod atproto;
 pub mod auth;
 pub mod config;
 pub mod db;

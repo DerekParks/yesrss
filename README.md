@@ -12,6 +12,33 @@ A small, safe, self-hosted feed reader in the spirit of Google Reader.
 - RSS 0.9–2.0, Atom, JSON Feed, podcasts (enclosures), YouTube channels (embedded player),
   feed autodiscovery from any web page, full-text search, favicons.
 
+## Bluesky / atproto
+
+Connect an atproto account (Settings → Bluesky) and yesrss can:
+
+- **Like** any item (`l`, or the heart in the article footer). A like is an
+  [`app.skyreader.social.recommend`](https://github.com/disnet/skyreader/tree/main/lexicons) record in your
+  repo, so it is visible to Skyreader and anything else that reads that lexicon. When the article is a
+  [standard.site](https://standard.site) document (its page has `<link rel="site.standard.document">`),
+  yesrss also writes a `site.standard.graph.recommend`.
+- **Find publications by people you follow**: standard.site publications from accounts you follow on
+  Bluesky, one click to subscribe.
+
+Sign-in is atproto OAuth (PAR + PKCE + DPoP, confidential client with an ES256 key generated on first use).
+Your PDS's authorization server must be able to fetch this server's client metadata, so it needs a
+**public HTTPS URL** (Pangolin, Caddy, Cloudflare Tunnel, Tailscale Funnel, …):
+
+```sh
+YESRSS_PUBLIC_URL=https://rss.example.com yesrss serve
+```
+
+Only `/oauth/client-metadata.json`, `/oauth/jwks.json` and `/oauth/callback` need to be reachable by the
+outside world. yesrss requests the `atproto transition:generic` scope, because Bluesky's authorization
+server does not yet advertise narrower scopes. Tokens are stored in the SQLite database, so protect it
+like any credential store. Likes are public: every atproto record is.
+
+Research notes and prior art: [`docs/research/atproto.md`](docs/research/atproto.md).
+
 ## Security posture
 
 Feed content is hostile input, and a feed reader is a server that fetches URLs on request. yesrss treats
@@ -86,6 +113,7 @@ Every flag also reads an environment variable.
 | `--refresh-minutes` | `YESRSS_REFRESH_MINUTES` | `30` | Refresh interval for healthy feeds |
 | `--retention-days` | `YESRSS_RETENTION_DAYS` | `90` | Keep read, unstarred entries this long once they leave the feed |
 | `--fetch-concurrency` | `YESRSS_FETCH_CONCURRENCY` | `8` | Parallel fetches |
+| `--public-url` | `YESRSS_PUBLIC_URL` | unset | Public HTTPS URL; enables Bluesky / atproto features |
 | `--max-feed-bytes` | `YESRSS_MAX_FEED_BYTES` | `16777216` | Largest accepted feed |
 
 Logging uses `RUST_LOG` (default `info`).
@@ -129,4 +157,5 @@ debug builds, so reload the browser to see changes).
 | `src/entries.rs` | Entry queries shared by both APIs |
 | `src/api.rs` | JSON API for the web UI |
 | `src/greader.rs` | Google Reader API |
+| `src/atproto/` | atproto OAuth client, identity resolution, likes, publication discovery |
 | `static/` | Web UI |

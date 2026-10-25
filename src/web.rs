@@ -20,6 +20,7 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-
 
 pub fn app(state: AppState) -> Router {
     let api = crate::api::router()
+        .merge(crate::atproto::routes::api_router())
         .nest("/greader", crate::greader::router())
         .nest("/greader.php", crate::greader::router());
     let headers: [(HeaderName, &'static str); 6] = [
@@ -32,6 +33,7 @@ pub fn app(state: AppState) -> Router {
     ];
     let mut router = Router::new()
         .nest("/api", api)
+        .merge(crate::atproto::routes::public_router())
         .fallback(static_handler)
         .with_state(state)
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))

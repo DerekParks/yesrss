@@ -153,6 +153,75 @@ impl Fetcher {
     }
 }
 
+#[derive(Debug)]
+pub struct Response {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    pub fn json(&self) -> Option<serde_json::Value> {
+        serde_json::from_slice(&self.body).ok()
+    }
+}
+
+pub enum Body<'a> {
+    Empty,
+    Form(&'a [(String, String)]),
+    Json(&'a serde_json::Value),
+}
+
+impl Fetcher {
+    /// Sends any request through the guarded client, returning non-2xx responses rather than erroring.
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        url: &Url,
+        headers: HeaderMap,
+        body: Body<'_>,
+        max_bytes: usize,
+    ) -> Result<Response, FetchError> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(FetchError::InvalidUrl(url.to_string()));
+        }
+        if !self.allow_private {
+            check_literal_host(url)?;
+        }
+        let mut req = self.client.request(method, url.clone()).headers(headers);
+        req = match body {
+            Body::Empty => req,
+            Body::Form(pairs) => req
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish()),
+            Body::Json(v) => req
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(v).expect("json values serialize")),
+        };
+        let resp = req.send().await?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len() + chunk.len() > max_bytes {
+                return Err(FetchError::TooLarge(max_bytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Response { status, headers, body })
+    }
+
+    pub fn allows_private(&self) -> bool {
+        self.allow_private
+    }
+}
+
 pub fn parse_http_url(raw: &str) -> Result<Url, FetchError> {
     let url = Url::parse(raw.trim()).map_err(|e| FetchError::InvalidUrl(format!("{raw}: {e}")))?;
     match url.scheme() {

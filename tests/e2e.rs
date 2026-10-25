@@ -444,3 +444,342 @@ async fn opml_custom_titles_survive_first_fetch() {
     titles.sort();
     assert_eq!(titles, ["My Name For It", "Test Blog"]);
 }
+
+mod atproto_flow {
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use wiremock::{Request as MockRequest, Respond};
+    use yesrss::atproto::identity::Network;
+
+    use super::*;
+
+    const DID: &str = "did:plc:alice";
+    const AUTHOR: &str = "did:plc:author";
+
+    fn jwt_part(jwt: &str, i: usize) -> Value {
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(jwt.split('.').nth(i).unwrap()).unwrap()).unwrap()
+    }
+
+    /// Verifies a DPoP proof's signature against its embedded key and returns its claims.
+    fn verified_dpop(req: &MockRequest) -> Value {
+        let jwt = req.headers.get("dpop").expect("DPoP header").to_str().unwrap();
+        let header = jwt_part(jwt, 0);
+        assert_eq!(header["typ"], "dpop+jwt");
+        assert_eq!(header["alg"], "ES256");
+        let mut sec1 = vec![4u8];
+        for c in ["x", "y"] {
+            sec1.extend(URL_SAFE_NO_PAD.decode(header["jwk"][c].as_str().unwrap()).unwrap());
+        }
+        let vk = VerifyingKey::from_sec1_bytes(&sec1).unwrap();
+        let (input, sig) = jwt.rsplit_once('.').unwrap();
+        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
+        vk.verify(input.as_bytes(), &sig).expect("valid DPoP signature");
+        let claims = jwt_part(jwt, 1);
+        assert_eq!(claims["htm"], req.method.as_str());
+        let htu = url::Url::parse(claims["htu"].as_str().unwrap()).unwrap();
+        assert_eq!(htu.path(), req.url.path());
+        assert!(htu.query().is_none() && htu.fragment().is_none());
+        claims
+    }
+
+    fn form(req: &MockRequest) -> std::collections::HashMap<String, String> {
+        url::form_urlencoded::parse(&req.body).into_owned().collect()
+    }
+
+    #[derive(Clone, Default)]
+    struct Seen {
+        state: Arc<Mutex<Option<String>>>,
+        records: Arc<Mutex<Vec<Value>>>,
+        deleted: Arc<Mutex<Vec<Value>>>,
+    }
+
+    struct AuthServer {
+        seen: Seen,
+        issuer: String,
+    }
+
+    impl Respond for AuthServer {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let claims = verified_dpop(req);
+            if claims["nonce"] != "as-nonce-1" {
+                return ResponseTemplate::new(400)
+                    .insert_header("dpop-nonce", "as-nonce-1")
+                    .set_body_json(json!({"error": "use_dpop_nonce"}));
+            }
+            let f = form(req);
+            assert_eq!(f["client_id"], "https://rss.test/oauth/client-metadata.json");
+            assert_eq!(f["client_assertion_type"], "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+            let assertion = jwt_part(&f["client_assertion"], 1);
+            assert_eq!(assertion["aud"], self.issuer);
+            assert_eq!(assertion["iss"], f["client_id"]);
+            match req.url.path() {
+                "/oauth/par" => {
+                    assert_eq!(f["code_challenge_method"], "S256");
+                    assert_eq!(f["redirect_uri"], "https://rss.test/oauth/callback");
+                    *self.seen.state.lock().unwrap() = Some(f["state"].clone());
+                    ResponseTemplate::new(201).set_body_json(json!({"request_uri": "urn:ietf:params:oauth:request_uri:abc", "expires_in": 60}))
+                }
+                "/oauth/token" => {
+                    let access = match f["grant_type"].as_str() {
+                        "authorization_code" => {
+                            assert_eq!(f["code"], "the-code");
+                            assert!(f["code_verifier"].len() >= 43);
+                            "at-1"
+                        }
+                        "refresh_token" => "at-2",
+                        other => panic!("unexpected grant {other}"),
+                    };
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "access_token": access, "refresh_token": "rt-1", "token_type": "DPoP",
+                        "sub": DID, "scope": "atproto transition:generic", "expires_in": 3600
+                    }))
+                }
+                "/oauth/revoke" => ResponseTemplate::new(200),
+                other => panic!("unexpected AS path {other}"),
+            }
+        }
+    }
+
+    struct Pds {
+        seen: Seen,
+    }
+
+    impl Respond for Pds {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let claims = verified_dpop(req);
+            if claims["nonce"] != "pds-nonce-1" {
+                return ResponseTemplate::new(401)
+                    .insert_header("dpop-nonce", "pds-nonce-1")
+                    .insert_header("www-authenticate", r#"DPoP error="use_dpop_nonce""#);
+            }
+            let auth = req.headers.get("authorization").unwrap().to_str().unwrap();
+            let token = auth.strip_prefix("DPoP ").expect("DPoP auth scheme");
+            let ath = URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(token.as_bytes()));
+            assert_eq!(claims["ath"], ath);
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["repo"], DID);
+            if req.url.path().ends_with("createRecord") {
+                let n = {
+                    let mut r = self.seen.records.lock().unwrap();
+                    r.push(body.clone());
+                    r.len()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"uri": format!("at://{DID}/{}/rk{n}", body["collection"].as_str().unwrap()), "cid": "bafy"}))
+            } else {
+                self.seen.deleted.lock().unwrap().push(body);
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            }
+        }
+    }
+
+    fn did_doc(did: &str, handle: &str, pds: &str) -> Value {
+        json!({
+            "id": did,
+            "alsoKnownAs": [format!("at://{handle}")],
+            "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds}]
+        })
+    }
+
+    async fn network() -> (MockServer, Seen) {
+        let server = MockServer::start().await;
+        let uri = server.uri();
+        let seen = Seen::default();
+        let ok_json = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+        Mock::given(path(format!("/{DID}"))).respond_with(ok_json(did_doc(DID, "alice.test", &uri))).mount(&server).await;
+        Mock::given(path(format!("/{AUTHOR}"))).respond_with(ok_json(did_doc(AUTHOR, "author.test", &uri))).mount(&server).await;
+        Mock::given(path("/xrpc/com.atproto.identity.resolveHandle"))
+            .respond_with(ok_json(json!({"did": DID})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/.well-known/oauth-protected-resource"))
+            .respond_with(ok_json(json!({"resource": uri, "authorization_servers": [uri]})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ok_json(json!({
+                "issuer": uri,
+                "authorization_endpoint": format!("{uri}/oauth/authorize"),
+                "token_endpoint": format!("{uri}/oauth/token"),
+                "pushed_authorization_request_endpoint": format!("{uri}/oauth/par"),
+                "revocation_endpoint": format!("{uri}/oauth/revoke"),
+                "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+                "dpop_signing_alg_values_supported": ["ES256"],
+            })))
+            .mount(&server)
+            .await;
+        for p in ["/oauth/par", "/oauth/token", "/oauth/revoke"] {
+            Mock::given(method("POST"))
+                .and(path(p))
+                .respond_with(AuthServer { seen: seen.clone(), issuer: uri.clone() })
+                .mount(&server)
+                .await;
+        }
+        for p in ["/xrpc/com.atproto.repo.createRecord", "/xrpc/com.atproto.repo.deleteRecord"] {
+            Mock::given(method("POST")).and(path(p)).respond_with(Pds { seen: seen.clone() }).mount(&server).await;
+        }
+        Mock::given(path("/xrpc/com.atproto.repo.getRecord")).respond_with(ok_json(json!({"value": {}}))).mount(&server).await;
+        let rss = format!(
+            r#"<rss version="2.0"><channel><title>Std</title><item><title>Doc post</title><link>{uri}/post1</link><guid>p1</guid></item>
+<item><title>Plain post</title><link>{uri}/post2</link><guid>p2</guid></item></channel></rss>"#
+        );
+        Mock::given(path("/feed.xml")).respond_with(ResponseTemplate::new(200).set_body_string(rss)).mount(&server).await;
+        Mock::given(path("/post1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><head><link rel="site.standard.document" href="at://{AUTHOR}/site.standard.document/doc1"></head></html>"#
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(path("/post2")).respond_with(ResponseTemplate::new(200).set_body_string("<html></html>")).mount(&server).await;
+        Mock::given(path("/xrpc/app.bsky.graph.getFollows"))
+            .respond_with(ok_json(json!({"follows": [{"did": AUTHOR, "handle": "author.test"}, {"did": "did:plc:quiet", "handle": "quiet.test"}]})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/xrpc/com.atproto.sync.listReposByCollection"))
+            .respond_with(ok_json(json!({"repos": [{"did": AUTHOR}, {"did": "did:plc:stranger"}]})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(ok_json(json!({"records": [{"uri": format!("at://{AUTHOR}/site.standard.publication/self"),
+                "value": {"url": format!("{uri}/"), "name": "Author's Notes", "description": "notes"}}]})))
+            .mount(&server)
+            .await;
+        (server, seen)
+    }
+
+    async fn app(server: &MockServer) -> TestApp {
+        let dir = tempfile::tempdir().unwrap();
+        let db = yesrss::db::connect(&dir.path().join("t.db")).await.unwrap();
+        let cfg = Config {
+            allow_private_networks: true,
+            public_url: Some(url::Url::parse("https://rss.test").unwrap()),
+            ..Config::default()
+        };
+        let base = url::Url::parse(&server.uri()).unwrap();
+        let net = Network { plc: base.clone(), appview: base.clone(), relay: base };
+        let state = AppState::with_network(db, cfg, net).unwrap();
+        TestApp { app: yesrss::web::app(state.clone()), state, _dir: dir }
+    }
+
+    async fn connect(t: &TestApp, seen: &Seen, cookie: &str, handle: &str) -> (Resp, String) {
+        let r = t.web(Method::POST, "/api/atproto/connect", Some(cookie), Some(json!({"handle": handle}))).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        let redirect = r.json()["redirect"].as_str().unwrap().to_owned();
+        assert!(redirect.contains("/oauth/authorize?client_id="), "{redirect}");
+        let set = r.headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().to_owned();
+        assert!(set.contains("SameSite=Lax") && set.contains("Path=/oauth/callback"), "{set}");
+        let browser = set.split(';').next().unwrap().to_owned();
+        let state = seen.state.lock().unwrap().clone().unwrap();
+        (r, format!("{browser}|{state}"))
+    }
+
+    async fn callback(t: &TestApp, server: &MockServer, browser_and_state: &str, with_cookie: bool) -> Resp {
+        let (browser, state) = browser_and_state.split_once('|').unwrap();
+        let iss = url::form_urlencoded::byte_serialize(server.uri().as_bytes()).collect::<String>();
+        let mut b = Request::builder().uri(format!("/oauth/callback?state={state}&iss={iss}&code=the-code"));
+        if with_cookie {
+            b = b.header(header::COOKIE, browser);
+        }
+        t.call(b.body(Body::empty()).unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn oauth_connect_like_and_discover() {
+        let (server, seen) = network().await;
+        let t = app(&server).await;
+        let cookie = setup_user(&t).await;
+        let c = Some(cookie.as_str());
+
+        let meta = t.call(Request::builder().uri("/oauth/client-metadata.json").body(Body::empty()).unwrap()).await.json();
+        assert_eq!(meta["token_endpoint_auth_method"], "private_key_jwt");
+        let jwks = t.call(Request::builder().uri("/oauth/jwks.json").body(Body::empty()).unwrap()).await.json();
+        assert_eq!(jwks["keys"][0]["crv"], "P-256");
+        assert!(jwks["keys"][0].get("d").is_none(), "private key must not be published");
+
+        assert!(t.web(Method::GET, "/api/atproto", c, None).await.json()["account"].is_null());
+
+        let (_, bs) = connect(&t, &seen, &cookie, "@Alice.test").await;
+        let page = callback(&t, &server, &bs, false).await;
+        assert!(page.text.contains("Sign-in mismatch"), "{}", page.text);
+        assert!(t.web(Method::GET, "/api/atproto", c, None).await.json()["account"].is_null());
+
+        let (_, bs) = connect(&t, &seen, &cookie, "alice.test").await;
+        let page = callback(&t, &server, &bs, true).await;
+        assert!(page.text.contains("Bluesky connected"), "{}", page.text);
+        let replay = callback(&t, &server, &bs, true).await;
+        assert!(replay.text.contains("expired or was already used"), "{}", replay.text);
+        let status = t.web(Method::GET, "/api/atproto", c, None).await.json();
+        assert_eq!(status["account"]["did"], DID);
+        assert_eq!(status["account"]["handle"], "alice.test");
+
+        let r = t.web(Method::POST, "/api/feeds", c, Some(json!({"url": format!("{}/feed.xml", server.uri())}))).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        let entries = t.web(Method::GET, "/api/entries", c, None).await.json();
+        let id_of = |title: &str| {
+            entries["entries"].as_array().unwrap().iter().find(|e| e["title"] == title).unwrap()["id"].as_i64().unwrap()
+        };
+        let (doc_id, plain_id) = (id_of("Doc post"), id_of("Plain post"));
+
+        let liked = t.web(Method::POST, &format!("/api/entries/{doc_id}/like"), c, None).await;
+        assert_eq!(liked.status, StatusCode::OK, "{}", liked.text);
+        assert_eq!(liked.json()["document_uri"], format!("at://{AUTHOR}/site.standard.document/doc1"));
+        let liked_plain = t.web(Method::POST, &format!("/api/entries/{plain_id}/like"), c, None).await.json();
+        assert!(liked_plain["document_uri"].is_null());
+        {
+            let records = seen.records.lock().unwrap();
+            assert_eq!(records.len(), 3, "{records:?}");
+            assert_eq!(records[0]["collection"], "app.skyreader.social.recommend");
+            assert_eq!(records[0]["record"]["subject"], format!("{}/post1", server.uri()));
+            assert_eq!(records[0]["record"]["document"], format!("at://{AUTHOR}/site.standard.document/doc1"));
+            assert_eq!(records[1]["collection"], "site.standard.graph.recommend");
+            assert_eq!(records[1]["record"]["document"], format!("at://{AUTHOR}/site.standard.document/doc1"));
+            assert_eq!(records[2]["record"]["subject"], format!("{}/post2", server.uri()));
+            assert!(records[2]["record"].get("document").is_none());
+        }
+        let listed = t.web(Method::GET, "/api/entries", c, None).await.json();
+        assert!(listed["entries"].as_array().unwrap().iter().all(|e| e["like_uri"].is_string()));
+
+        let r = t.web(Method::DELETE, &format!("/api/entries/{doc_id}/like"), c, None).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text);
+        assert_eq!(seen.deleted.lock().unwrap().len(), 2);
+
+        let pubs = t.web(Method::GET, "/api/atproto/publications", c, None).await;
+        assert_eq!(pubs.status, StatusCode::OK, "{}", pubs.text);
+        let pubs = pubs.json();
+        let list = pubs["publications"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0]["handle"], "author.test");
+        assert_eq!(list[0]["name"], "Author's Notes");
+
+        let other = {
+            let u = yesrss::auth::create_user(&t.state.db, "mallory", "mallorypassword").await.unwrap();
+            let s = yesrss::auth::create_session(&t.state.db, u.id, yesrss::auth::SessionKind::Web).await.unwrap();
+            format!("yesrss_session={s}")
+        };
+        let r = t.web(Method::POST, &format!("/api/entries/{plain_id}/like"), Some(&other), None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+        sqlx::query("UPDATE atproto_accounts SET expires_at = 0").execute(&t.state.db).await.unwrap();
+        let r = t.web(Method::POST, &format!("/api/entries/{doc_id}/like"), c, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        let token: String = sqlx::query_scalar("SELECT access_token FROM atproto_accounts").fetch_one(&t.state.db).await.unwrap();
+        assert_eq!(token, "at-2", "expired token should have been refreshed");
+
+        let r = t.web(Method::DELETE, "/api/atproto", c, None).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        assert!(t.web(Method::GET, "/api/atproto", c, None).await.json()["account"].is_null());
+    }
+
+    #[tokio::test]
+    async fn disabled_without_public_url() {
+        let t = TestApp::new().await;
+        let c = setup_user(&t).await;
+        assert_eq!(t.web(Method::GET, "/api/atproto", Some(&c), None).await.json()["enabled"], false);
+        let r = t.call(Request::builder().uri("/oauth/client-metadata.json").body(Body::empty()).unwrap()).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+}
