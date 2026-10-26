@@ -487,6 +487,11 @@ async function markAllRead(scope, label, count) {
       || (!scope.feed && !scope.folder && !scope.starred && S.route.kind === 'all');
     await api('POST', '/entries/mark-read', { ...scope, as_of: sameAsView && S.asOf ? S.asOf : undefined });
     await loadTree();
+    if (scope.feed && sameAsView) {
+      toast('Marked as read');
+      go(nextUnreadFeed(scope.feed) || { kind: 'all' });
+      return;
+    }
     for (const e of S.entries) {
       const hit = (!scope.feed && !scope.folder && !scope.starred)
         || (scope.feed && e.feed_id === scope.feed)
@@ -1027,6 +1032,16 @@ function sidebarOrder() {
   return order;
 }
 
+function nextUnreadFeed(fromId) {
+  const feeds = sidebarOrder().filter((r) => r.kind === 'feed');
+  const cur = feeds.findIndex((r) => r.id === fromId);
+  for (let n = 1; n < feeds.length; n++) {
+    const r = feeds[(cur + n + feeds.length) % feeds.length];
+    if (feedById(r.id)?.unread > 0) return r;
+  }
+  return null;
+}
+
 function moveSidebar(delta, unreadOnly = false) {
   const order = sidebarOrder();
   const cur = order.findIndex((r) => r.kind === S.route.kind && r.id === S.route.id);
@@ -1049,7 +1064,7 @@ const SHORTCUTS = [
   ['m', 'Mark read / unread'],
   ['v', 'Open original in a new tab'],
   ['l', 'Like on Bluesky / atproto'],
-  ['Shift + A', 'Mark all in view as read'],
+  ['Shift + A', 'Mark all in view as read (in a feed, then go to the next unread one)'],
   ['Shift + J / K', 'Next / previous subscription'],
   ['Shift + N', 'Next subscription with unread items'],
   ['g a / g s', 'Go to All items / Starred'],
