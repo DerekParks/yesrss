@@ -2,7 +2,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
@@ -22,6 +22,11 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
+}
+
+/// Starts a transaction that holds the write lock from its first statement.
+pub async fn begin_write(db: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    db.begin_with("BEGIN IMMEDIATE").await
 }
 
 pub fn now() -> i64 {

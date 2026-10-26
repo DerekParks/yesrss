@@ -74,7 +74,7 @@ async fn user_id(db: &sqlx::SqlitePool, username: &str) -> anyhow::Result<i64> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn,html5ever=error")))
         .init();
     let cli = Cli::parse();
     let db = db::connect(&cli.db)

@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-use crate::db::now;
+use crate::db::{begin_write, now};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -111,7 +111,7 @@ pub async fn set_password(db: &SqlitePool, user_id: i64, password: &str) -> AppR
         )));
     }
     let hash = hash_blocking(password).await?;
-    let mut tx = db.begin().await?;
+    let mut tx = begin_write(db).await?;
     sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(hash)
         .bind(user_id)

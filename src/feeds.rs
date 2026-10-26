@@ -4,7 +4,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use url::Url;
 
-use crate::db::now;
+use crate::db::{begin_write, now};
 use crate::error::{AppError, AppResult};
 use crate::fetch::{FetchOutcome, Fetched, Fetcher, parse_http_url};
 use crate::opml::OpmlFeed;
@@ -185,7 +185,7 @@ pub async fn store_entries(
     entries: &[NewEntry],
     seen_at: i64,
 ) -> AppResult<usize> {
-    let mut tx = db.begin().await?;
+    let mut tx = begin_write(db).await?;
     let mut added = 0;
     for e in entries {
         let existing: Option<(i64, String)> =
