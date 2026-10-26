@@ -43,7 +43,7 @@ async fn writes_succeed_while_feeds_refresh() {
             tokio::spawn(async move {
                 for round in 0..30 {
                     let batch: Vec<_> = (0..40).map(|i| entry(feed, round % 3, i)).collect();
-                    store_entries(&db, feed, user.id, &batch, round as i64).await?;
+                    store_entries(&db, feed, user.id, &batch, round as i64, None).await?;
                     sqlx::query(
                         "INSERT INTO favicons (feed_id, content_type, data, fetched_at) VALUES (?, NULL, NULL, ?)
                          ON CONFLICT (feed_id) DO UPDATE SET fetched_at = excluded.fetched_at",

@@ -172,7 +172,7 @@ pub async fn subscribe(
         AppError::Conflict(_) => AppError::Conflict("already subscribed to this feed".into()),
         other => other,
     })?;
-    store_entries(&state.db, feed_id, user_id, &r.parsed.entries, t).await?;
+    store_entries(&state.db, feed_id, user_id, &r.parsed.entries, t, None).await?;
     let st = state.clone();
     tokio::spawn(async move { update_favicon(&st, feed_id).await });
     Ok(feed_id)
@@ -184,6 +184,7 @@ pub async fn store_entries(
     user_id: i64,
     entries: &[NewEntry],
     seen_at: i64,
+    read_before: Option<i64>,
 ) -> AppResult<usize> {
     let mut tx = begin_write(db).await?;
     let mut added = 0;
@@ -196,10 +197,12 @@ pub async fn store_entries(
                 .await?;
         match existing {
             None => {
+                let backfilled_read = read_before.is_some_and(|t| e.published_at <= t);
                 let id: i64 = sqlx::query_scalar(
                     "INSERT INTO entries (feed_id, user_id, guid, url, title, author, content, snippet,
-                         enclosure_url, enclosure_type, content_hash, published_at, created_at, last_seen_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                         enclosure_url, enclosure_type, content_hash, published_at, created_at, last_seen_at,
+                         is_read, read_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 )
                 .bind(feed_id)
                 .bind(user_id)
@@ -215,6 +218,8 @@ pub async fn store_entries(
                 .bind(e.published_at)
                 .bind(seen_at)
                 .bind(seen_at)
+                .bind(backfilled_read)
+                .bind(backfilled_read.then_some(seen_at))
                 .fetch_one(&mut *tx)
                 .await?;
                 sqlx::query("INSERT INTO entries_fts (rowid, title, body) VALUES (?, ?, ?)")
@@ -281,12 +286,15 @@ struct FeedFetchRow {
     etag: Option<String>,
     last_modified: Option<String>,
     error_count: i64,
+    read_before: Option<i64>,
 }
 
 /// Fetches one feed and stores any new entries. Returns the number of new entries.
 pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
     let feed: FeedFetchRow = sqlx::query_as(
-        "SELECT user_id, url, etag, last_modified, error_count FROM feeds WHERE id = ?",
+        "SELECT user_id, url, etag, last_modified, error_count,
+             CASE WHEN last_success_at IS NULL THEN read_before END AS read_before
+         FROM feeds WHERE id = ?",
     )
     .bind(feed_id)
     .fetch_one(&state.db)
@@ -323,7 +331,7 @@ pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
             return Err(AppError::bad(msg));
         }
     };
-    match store_refresh(state, feed_id, feed.user_id, &fetched, &parsed, t).await {
+    match store_refresh(state, feed_id, &feed, &fetched, &parsed, t).await {
         Ok(added) => {
             update_favicon(state, feed_id).await;
             Ok(added)
@@ -339,12 +347,12 @@ pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
 async fn store_refresh(
     state: &AppState,
     feed_id: i64,
-    user_id: i64,
+    feed: &FeedFetchRow,
     fetched: &Fetched,
     parsed: &ParsedFeed,
     t: i64,
 ) -> AppResult<usize> {
-    let added = store_entries(&state.db, feed_id, user_id, &parsed.entries, t).await?;
+    let added = store_entries(&state.db, feed_id, feed.user_id, &parsed.entries, t, feed.read_before).await?;
     sqlx::query(
         "UPDATE feeds SET user_title = COALESCE(user_title,
                  CASE WHEN last_success_at IS NULL AND title NOT IN (?1, url) THEN title END),

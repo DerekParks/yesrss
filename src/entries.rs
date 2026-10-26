@@ -1,7 +1,7 @@
 use serde::Serialize;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use crate::db::now;
+use crate::db::{begin_write, now};
 use crate::error::AppResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -222,6 +222,7 @@ pub struct MarkScope {
 }
 
 pub async fn mark_all_read(db: &SqlitePool, user_id: i64, scope: MarkScope) -> AppResult<u64> {
+    let mut tx = begin_write(db).await?;
     let mut qb = QueryBuilder::new("UPDATE entries SET is_read = 1, read_at = ");
     qb.push_bind(now())
         .push(" WHERE is_read = 0 AND user_id = ")
@@ -243,7 +244,23 @@ pub async fn mark_all_read(db: &SqlitePool, user_id: i64, scope: MarkScope) -> A
     if let Some(t) = scope.published_before {
         qb.push(" AND published_at <= ").push_bind(t);
     }
-    Ok(qb.build().execute(db).await?.rows_affected())
+    let marked = qb.build().execute(&mut *tx).await?.rows_affected();
+
+    if let Some(cutoff) = scope.published_before.or(scope.created_before).filter(|_| !scope.starred) {
+        let mut qb = QueryBuilder::new("UPDATE feeds SET read_before = MAX(COALESCE(read_before, 0), ");
+        qb.push_bind(cutoff)
+            .push(") WHERE last_success_at IS NULL AND user_id = ")
+            .push_bind(user_id);
+        if let Some(id) = scope.feed_id {
+            qb.push(" AND id = ").push_bind(id);
+        }
+        if let Some(id) = scope.folder_id {
+            qb.push(" AND folder_id = ").push_bind(id);
+        }
+        qb.build().execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(marked)
 }
 
 #[cfg(test)]

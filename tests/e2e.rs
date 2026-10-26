@@ -445,6 +445,57 @@ async fn opml_custom_titles_survive_first_fetch() {
     assert_eq!(titles, ["My Name For It", "Test Blog"]);
 }
 
+#[tokio::test]
+async fn backfill_after_mark_all_read_arrives_read() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/late.xml"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/late.xml"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "application/rss+xml").set_body_string(RSS))
+        .mount(&server)
+        .await;
+    let t = TestApp::new().await;
+    let cookie = setup_user(&t).await;
+    let c = Some(cookie.as_str());
+    let opml = format!(r#"<opml version="2.0"><body><outline xmlUrl="{}/late.xml"/></body></opml>"#, server.uri());
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/opml")
+        .header("x-yesrss", "1")
+        .header(header::COOKIE, cookie.as_str())
+        .body(Body::from(opml))
+        .unwrap();
+    assert_eq!(t.call(req).await.json()["added"], 1);
+    let feed = t.web(Method::GET, "/api/tree", c, None).await.json()["feeds"][0]["id"].as_i64().unwrap();
+    let refresh = format!("/api/feeds/{feed}/refresh");
+
+    assert_eq!(t.web(Method::POST, &refresh, c, None).await.status, StatusCode::BAD_REQUEST);
+    let r = t.web(Method::POST, "/api/entries/mark-read", c, Some(json!({}))).await;
+    assert_eq!(r.json()["marked"], 0);
+
+    assert_eq!(t.web(Method::POST, &refresh, c, None).await.json()["new"], 2);
+    assert_eq!(t.web(Method::GET, "/api/tree", c, None).await.json()["unread"], 0);
+
+    let late_item = RSS.replace(
+        "</channel>",
+        "<item><title>Backdated</title><guid>backdated</guid><pubDate>Wed, 03 Sep 2025 10:00:00 GMT</pubDate></item></channel>",
+    );
+    Mock::given(method("GET"))
+        .and(path("/late.xml"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "application/rss+xml").set_body_string(late_item))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    assert_eq!(t.web(Method::POST, &refresh, c, None).await.json()["new"], 1);
+    assert_eq!(t.web(Method::GET, "/api/tree", c, None).await.json()["unread"], 1);
+}
+
 mod atproto_flow {
     use std::sync::{Arc, Mutex};
 

@@ -1,0 +1,1 @@
+ALTER TABLE feeds ADD COLUMN read_before INTEGER;
