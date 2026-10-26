@@ -2,7 +2,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Sqlite, SqlitePool, Transaction};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
@@ -15,9 +15,17 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(15));
+        .busy_timeout(Duration::from_secs(15))
+        .pragma("temp_store", "memory");
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
+        // Closes connections still counting a transaction that SQLite already rolled back.
+        .after_release(|conn, _| {
+            Box::pin(async move {
+                conn.ping().await?;
+                Ok(!conn.is_in_transaction())
+            })
+        })
         .connect_with(opts)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;

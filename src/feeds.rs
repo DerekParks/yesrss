@@ -323,7 +323,28 @@ pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
             return Err(AppError::bad(msg));
         }
     };
-    let added = store_entries(&state.db, feed_id, feed.user_id, &parsed.entries, t).await?;
+    match store_refresh(state, feed_id, feed.user_id, &fetched, &parsed, t).await {
+        Ok(added) => {
+            update_favicon(state, feed_id).await;
+            Ok(added)
+        }
+        Err(e) => {
+            let msg = format!("storing entries failed: {e}");
+            record_failure(state, feed_id, feed.error_count, &msg, None, t).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn store_refresh(
+    state: &AppState,
+    feed_id: i64,
+    user_id: i64,
+    fetched: &Fetched,
+    parsed: &ParsedFeed,
+    t: i64,
+) -> AppResult<usize> {
+    let added = store_entries(&state.db, feed_id, user_id, &parsed.entries, t).await?;
     sqlx::query(
         "UPDATE feeds SET user_title = COALESCE(user_title,
                  CASE WHEN last_success_at IS NULL AND title NOT IN (?1, url) THEN title END),
@@ -340,7 +361,6 @@ pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
     .bind(feed_id)
     .execute(&state.db)
     .await?;
-    update_favicon(state, feed_id).await;
     Ok(added)
 }
 

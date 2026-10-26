@@ -5,6 +5,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::db::now;
+use crate::error::AppError;
 use crate::feeds::{purge_old_entries, refresh_feed};
 use crate::state::AppState;
 
@@ -60,7 +61,8 @@ async fn refresh_due(state: &AppState, permits: &Arc<Semaphore>) -> anyhow::Resu
             match refresh_feed(&st, feed_id).await {
                 Ok(n) if n > 0 => tracing::info!(feed_id, new_entries = n, "feed refreshed"),
                 Ok(_) => tracing::debug!(feed_id, "feed unchanged"),
-                Err(_) => {}
+                Err(AppError::BadRequest(_)) => {}
+                Err(e) => tracing::error!(feed_id, error = %e, "feed refresh failed"),
             }
         });
     }
