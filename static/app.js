@@ -29,6 +29,8 @@ const ICONS = {
   share: '<path d="M12 4v11M7.5 8.5 12 4l4.5 4.5"/><path d="M5 13v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>',
   circle: '<circle cx="12" cy="12" r="4.5"/>',
+  heart: '<path d="M12 20s-7.5-4.6-7.5-10.2A4.2 4.2 0 0 1 12 7.4a4.2 4.2 0 0 1 7.5 2.4C19.5 15.4 12 20 12 20z"/>',
+  butterfly: '<path d="M12 11c-1.6-3.2-5.4-7-8-7-1.5 0-1.5 2.6-.8 5.2.7 2.5 2.6 3.3 4.8 3.1-3.3.7-3.8 3.2-1.6 5.3C9 20 11 17 12 14c1 3 3 6 5.6 3.6 2.2-2.1 1.7-4.6-1.6-5.3 2.2.2 4.1-.6 4.8-3.1.7-2.6.7-5.2-.8-5.2-2.6 0-6.4 3.8-8 7z"/>',
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -105,6 +107,7 @@ const S = {
   openId: null,
   gen: 0,
   prefs: loadPrefs(),
+  atproto: { enabled: false, account: null },
 };
 
 /* ---------------- api ---------------- */
@@ -849,6 +852,9 @@ function articleEl(e, feed) {
     h('footer', {},
       h('button', { class: `btn ghost${e.is_starred ? ' starred-on' : ''}`, onclick: () => toggleStar(e) }, icon('star', 'sm'), e.is_starred ? 'Starred' : 'Star'),
       h('button', { class: `btn ghost${!e.is_read ? ' on' : ''}`, onclick: () => setRead(e, !e.is_read) }, icon(e.is_read ? 'circle' : 'check', 'sm'), e.is_read ? 'Mark unread' : 'Mark read'),
+      S.atproto.account && e.url && h('button', {
+        class: `btn ghost${e.like_uri ? ' liked-on' : ''}`, title: 'Like on Bluesky / atproto (l)', onclick: () => toggleLike(e),
+      }, icon('heart', 'sm'), e.like_uri ? 'Liked' : 'Like'),
       e.url && h('a', { class: 'btn ghost', href: e.url, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 'sm'), 'Open original'),
       share));
 }
@@ -897,6 +903,32 @@ async function toggleStar(e) {
     updateEntryEl(e);
     renderSidebar();
     fail(err);
+  }
+}
+
+const liking = new Set();
+async function toggleLike(e) {
+  if (!S.atproto.account) { openSettings('bluesky'); return; }
+  if (!e.url || liking.has(e.id)) return;
+  liking.add(e.id);
+  const was = e.like_uri;
+  e.like_uri = was ? null : 'pending';
+  updateEntryEl(e);
+  try {
+    if (was) {
+      await api('DELETE', `/entries/${e.id}/like`);
+      toast('Like removed');
+    } else {
+      const r = await api('POST', `/entries/${e.id}/like`);
+      e.like_uri = r.like_uri;
+      toast(r.document_uri ? 'Liked, and recommended on standard.site' : `Liked as @${S.atproto.account.handle}`);
+    }
+  } catch (err) {
+    e.like_uri = was;
+    fail(err);
+  } finally {
+    liking.delete(e.id);
+    updateEntryEl(e);
   }
 }
 
@@ -1016,6 +1048,7 @@ const SHORTCUTS = [
   ['s', 'Star / unstar'],
   ['m', 'Mark read / unread'],
   ['v', 'Open original in a new tab'],
+  ['l', 'Like on Bluesky / atproto'],
   ['Shift + A', 'Mark all in view as read'],
   ['Shift + J / K', 'Next / previous subscription'],
   ['Shift + N', 'Next subscription with unread items'],
@@ -1059,6 +1092,7 @@ function onKey(ev) {
     s: () => cur && toggleStar(cur),
     m: () => cur && setRead(cur, !cur.is_read),
     v: () => cur?.url && window.open(cur.url, '_blank', 'noopener,noreferrer'),
+    l: () => cur && toggleLike(cur),
     A: () => markViewRead(),
     J: () => moveSidebar(1),
     K: () => moveSidebar(-1),
@@ -1085,6 +1119,7 @@ function openSettings(tab = 'subscriptions') {
     ['import', 'Import / export'],
     ['appearance', 'Reading'],
     ['apps', 'Mobile apps'],
+    ['bluesky', 'Bluesky'],
     ['account', 'Account'],
   ];
   const body = h('div', { class: 'tab-body' });
@@ -1231,6 +1266,85 @@ const SETTINGS = {
     ];
   },
 
+  bluesky() {
+    if (!S.atproto.enabled) {
+      return [h('section', {},
+        h('h4', {}, 'Connect Bluesky / atproto'),
+        h('p', {}, 'Liking items publishes them to your atproto account, so they show up in Skyreader and other apps that read the same records. yesrss can also find standard.site publications by people you follow.'),
+        h('p', {}, 'Bluesky sign-in needs this server on a public HTTPS address (a reverse proxy or tunnel such as Pangolin, Caddy or Tailscale Funnel). Start yesrss with:'),
+        h('div', { class: 'copy-row' }, h('input', { class: 'input', readonly: true, value: 'YESRSS_PUBLIC_URL=https://rss.example.com' })))];
+    }
+    const acct = S.atproto.account;
+    if (!acct) {
+      const handle = h('input', { class: 'input', placeholder: 'you.bsky.social', autocapitalize: 'none', spellcheck: 'false', required: true });
+      const err = h('div', { class: 'error-text' });
+      const btn = h('button', { class: 'btn primary', type: 'submit' }, icon('butterfly', 'sm'), 'Connect');
+      return [h('section', {},
+        h('h4', {}, 'Connect your atproto account'),
+        h('p', {}, 'You’ll sign in on your own server (bsky.social or your PDS) and come right back. yesrss never sees your password.'),
+        h('form', {
+          onsubmit: async (ev) => {
+            ev.preventDefault();
+            err.textContent = '';
+            btn.disabled = true;
+            try {
+              const r = await api('POST', '/atproto/connect', { handle: handle.value });
+              location.href = r.redirect;
+            } catch (e2) { err.textContent = e2.message; btn.disabled = false; }
+          },
+        }, h('div', { class: 'field' }, h('label', {}, 'Handle'), handle), err, btn),
+        h('p', { class: 'hint', style: 'margin-top:12px' }, 'Likes are public records in your account (app.skyreader.social.recommend, plus site.standard.graph.recommend for standard.site articles).'))];
+    }
+    const list = h('div', { class: 'pub-list' });
+    const loadBtn = h('button', {
+      class: 'btn', onclick: async () => {
+        loadBtn.disabled = true;
+        list.replaceChildren(h('p', { class: 'hint' }, 'Checking who you follow… this can take a few seconds.'));
+        try {
+          const { publications } = await api('GET', '/atproto/publications');
+          list.replaceChildren(...(publications.length ? publications.map((p) => {
+            const sub = h('button', {
+              class: `btn${p.subscribed ? '' : ' primary'}`, disabled: p.subscribed,
+              onclick: async () => {
+                sub.disabled = true;
+                sub.textContent = 'Subscribing…';
+                try {
+                  await api('POST', '/feeds', { url: p.url });
+                  sub.textContent = 'Subscribed';
+                  sub.classList.remove('primary');
+                  await loadTree();
+                } catch (e2) { sub.disabled = false; sub.textContent = 'Subscribe'; fail(e2); }
+              },
+            }, p.subscribed ? 'Subscribed' : 'Subscribe');
+            return h('div', { class: 'pub' },
+              h('div', { class: 'pub-text' },
+                h('b', {}, p.name),
+                h('small', {}, `@${p.handle} · `, h('a', { href: p.url, target: '_blank', rel: 'noopener noreferrer' }, p.url.replace(/^https?:\/\//, '').replace(/\/$/, ''))),
+                p.description && h('span', { class: 'hint' }, p.description)),
+              sub);
+          }) : [h('p', {}, 'Nobody you follow has a standard.site publication yet.')]));
+        } catch (e2) { list.replaceChildren(); fail(e2); } finally { loadBtn.disabled = false; }
+      },
+    }, icon('search', 'sm'), 'Find publications');
+    return [
+      h('section', {},
+        h('h4', {}, 'Connected'),
+        h('p', {}, 'Signed in as ', h('b', {}, `@${acct.handle}`), h('span', { class: 'hint' }, ` (${acct.did})`)),
+        h('div', { class: 'radio-row' },
+          h('button', {
+            class: 'btn danger', onclick: async () => {
+              const ok = await ask({ title: 'Disconnect Bluesky?', message: 'Existing likes stay in your account. yesrss will forget its session.', confirm: 'Disconnect', danger: true });
+              if (!ok) return;
+              try { await api('DELETE', '/atproto'); await loadAtproto(); document.querySelector('dialog[open]')?.close(); openSettings('bluesky'); loadStream(); } catch (e2) { fail(e2); }
+            },
+          }, icon('logout', 'sm'), 'Disconnect'))),
+      h('section', {},
+        h('h4', {}, 'From people you follow'),
+        h('p', {}, 'standard.site publications by accounts you follow on Bluesky.'),
+        loadBtn, list),
+    ];
+  },
+
   account() {
     const cur = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', required: true });
     const next = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', minlength: '8', required: true });
@@ -1270,11 +1384,21 @@ const SETTINGS = {
 
 /* ---------------- boot ---------------- */
 
+async function loadAtproto() {
+  try { S.atproto = await api('GET', '/atproto'); } catch { S.atproto = { enabled: false, account: null }; }
+}
+
 let treeTimer = 0;
 async function boot() {
+  const connected = location.hash === '#/connected';
+  if (connected) history.replaceState(null, '', '#/all');
   renderShell();
-  try { await loadTree(); } catch (e) { fail(e); }
+  await Promise.all([loadTree().catch(fail), loadAtproto()]);
   await loadStream();
+  if (connected) {
+    openSettings('bluesky');
+    if (S.atproto.account) toast(`Connected as @${S.atproto.account.handle}`);
+  }
   clearInterval(treeTimer);
   treeTimer = setInterval(() => { if (S.user && !document.hidden) loadTree().catch(() => {}); }, 90_000);
 }

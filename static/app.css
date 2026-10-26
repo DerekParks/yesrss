@@ -280,6 +280,13 @@ svg.i.sm { width: 15px; height: 15px; }
 .article footer .btn.on { color: var(--accent-text); }
 .article footer .btn.starred-on { color: var(--star); }
 .article footer .btn.starred-on svg { fill: currentColor; }
+.article footer .btn.liked-on { color: #e0245e; }
+.article footer .btn.liked-on svg { fill: currentColor; }
+.pub-list { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.pub { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
+.pub-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pub-text small { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pub-text .hint { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 
 .sentinel { height: 1px; }
 .loading-more { text-align: center; color: var(--text-3); padding: 18px; font-size: 13px; }

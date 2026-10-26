@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 
+use url::Url;
+
 #[derive(clap::Args, Clone, Debug)]
 pub struct Config {
     /// Address to listen on.
@@ -27,6 +29,11 @@ pub struct Config {
     #[arg(long, env = "YESRSS_FETCH_CONCURRENCY", default_value_t = 8)]
     pub fetch_concurrency: usize,
 
+    /// Public HTTPS URL of this server. Required for atproto (Bluesky) sign-in, whose
+    /// authorization server must fetch this server's OAuth client metadata.
+    #[arg(long, env = "YESRSS_PUBLIC_URL")]
+    pub public_url: Option<Url>,
+
     /// Largest feed document accepted, in bytes.
     #[arg(long, env = "YESRSS_MAX_FEED_BYTES", default_value_t = 16 * 1024 * 1024)]
     pub max_feed_bytes: usize,
@@ -41,6 +48,7 @@ impl Default for Config {
             refresh_minutes: 30,
             retention_days: 90,
             fetch_concurrency: 8,
+            public_url: None,
             max_feed_bytes: 16 * 1024 * 1024,
         }
     }

@@ -63,6 +63,7 @@ pub struct EntryRow {
     pub created_at: i64,
     pub is_read: bool,
     pub is_starred: bool,
+    pub like_uri: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -152,7 +153,7 @@ pub async fn list(db: &SqlitePool, f: &Filter) -> AppResult<(Vec<EntryRow>, Opti
     let mut qb = QueryBuilder::new(
         "SELECT e.id, e.feed_id, COALESCE(f.user_title, f.title) AS feed_title, f.site_url AS feed_site_url,
                 fo.name AS folder_name, e.title, e.url, e.author, e.content, e.snippet, e.enclosure_url,
-                e.enclosure_type, e.published_at, e.created_at, e.is_read, e.is_starred
+                e.enclosure_type, e.published_at, e.created_at, e.is_read, e.is_starred, e.like_uri
          FROM entries e JOIN feeds f ON f.id = e.feed_id LEFT JOIN folders fo ON fo.id = f.folder_id",
     );
     push_where(&mut qb, f);
