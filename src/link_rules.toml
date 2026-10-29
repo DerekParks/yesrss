@@ -1,0 +1,31 @@
+# Link rules applied to every feed item: its own link and the links and images in its body.
+#
+# [[unwrap]]  A link matching `pattern` is replaced by the URL its `(?<url>…)` group captures.
+#             `decode = true` percent-decodes that capture first. Unwrapping repeats, so a wrapper
+#             inside a wrapper is peeled too. A result that is not an http(s) URL is ignored.
+# [[drop]]    A link or image whose URL matches `pattern` is removed, along with its contents.
+#
+# Patterns use Rust regex syntax (https://docs.rs/regex/latest/regex/#syntax) and see the URL
+# exactly as the feed wrote it. YESRSS_LINK_RULES names an optional file of extra rules in this
+# same format. Changing the rules re-applies them to stored items at the next start.
+
+[[unwrap]]
+name = "FeedBlitz click tracking"
+pattern = '^https?://feeds\.feedblitz\.com/~/t/\d+/\d+/[^/]+/~(?<url>https?://.+)$'
+
+[[unwrap]]
+name = "Outlook Safe Links"
+pattern = '^https://[a-z0-9-]+\.safelinks\.protection\.outlook\.com/\?(?:[^#]*&)?url=(?<url>[^&#]+)'
+decode = true
+
+[[drop]]
+name = "FeedBlitz share buttons"
+pattern = '^https?://feeds\.feedblitz\.com/_/\d+/'
+
+[[drop]]
+name = "FeedBlitz tracking pixel"
+pattern = '^https?://feeds\.feedblitz\.com/~/i/'
+
+[[drop]]
+name = "FeedBlitz icons"
+pattern = '^https?://assets\.feedblitz\.com/i/'

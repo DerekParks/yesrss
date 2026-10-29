@@ -75,7 +75,7 @@ pub async fn discover(state: &AppState, input: &str) -> AppResult<Vec<Candidate>
     let url = normalize_input(input)?;
     let max = state.cfg.max_feed_bytes;
     let fetched = fetch_fresh(&state.fetcher, &url, max).await?;
-    if let Ok(parsed) = parse_feed(&fetched.body, &fetched.final_url, now()) {
+    if let Ok(parsed) = parse_feed(&fetched.body, &fetched.final_url, now(), &state.link_rules) {
         return Ok(vec![Candidate { url: fetched.final_url.into(), title: Some(parsed.title) }]);
     }
     let mut found = alternate_links(&fetched.body, &fetched.final_url);
@@ -86,7 +86,7 @@ pub async fn discover(state: &AppState, input: &str) -> AppResult<Vec<Candidate>
     for path in COMMON_FEED_PATHS {
         let Ok(guess) = fetched.final_url.join(path) else { continue };
         if let Ok(f) = fetch_fresh(&state.fetcher, &guess, max).await
-            && let Ok(parsed) = parse_feed(&f.body, &f.final_url, now())
+            && let Ok(parsed) = parse_feed(&f.body, &f.final_url, now(), &state.link_rules)
         {
             return Ok(vec![Candidate { url: f.final_url.into(), title: Some(parsed.title) }]);
         }
@@ -98,14 +98,14 @@ async fn resolve(state: &AppState, input: &str) -> AppResult<Resolved> {
     let url = normalize_input(input)?;
     let max = state.cfg.max_feed_bytes;
     let fetched = fetch_fresh(&state.fetcher, &url, max).await?;
-    if let Ok(parsed) = parse_feed(&fetched.body, &fetched.final_url, now()) {
+    if let Ok(parsed) = parse_feed(&fetched.body, &fetched.final_url, now(), &state.link_rules) {
         return Ok(Resolved { url: fetched.final_url.clone(), fetched, parsed });
     }
     let candidates = discover(state, input).await?;
     let first = candidates.first().ok_or_else(|| AppError::bad("no feed found"))?;
     let url = Url::parse(&first.url).map_err(|e| AppError::bad(e.to_string()))?;
     let fetched = fetch_fresh(&state.fetcher, &url, max).await?;
-    let parsed = parse_feed(&fetched.body, &fetched.final_url, now())
+    let parsed = parse_feed(&fetched.body, &fetched.final_url, now(), &state.link_rules)
         .map_err(|e| AppError::bad(format!("{url} is not a valid feed: {e}")))?;
     Ok(Resolved { url: fetched.final_url.clone(), fetched, parsed })
 }
@@ -323,7 +323,7 @@ pub async fn refresh_feed(state: &AppState, feed_id: i64) -> AppResult<usize> {
             return Err(AppError::bad(e.to_string()));
         }
     };
-    let parsed = match parse_feed(&fetched.body, &fetched.final_url, t) {
+    let parsed = match parse_feed(&fetched.body, &fetched.final_url, t, &state.link_rules) {
         Ok(p) => p,
         Err(e) => {
             let msg = format!("not a valid feed: {e}");

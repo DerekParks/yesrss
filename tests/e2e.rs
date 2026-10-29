@@ -496,6 +496,34 @@ async fn backfill_after_mark_all_read_arrives_read() {
     assert_eq!(t.web(Method::GET, "/api/tree", c, None).await.json()["unread"], 1);
 }
 
+#[tokio::test]
+async fn changed_link_rules_rewrite_stored_entries() {
+    let server = feed_server().await;
+    let t = TestApp::new().await;
+    let cookie = setup_user(&t).await;
+    let r = t.web(Method::POST, "/api/feeds", Some(&cookie), Some(json!({"url": format!("{}/feed.xml", server.uri())}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+
+    let wrapped = r#"<p><a href="https://feeds.feedblitz.com/~/t/0/0/mr/~https://example.org/paper">paper</a></p><div><a href="https://feeds.feedblitz.com/_/28/1/mr"><img src="https://assets.feedblitz.com/i/fblike20.png"></a></div>"#;
+    sqlx::query("UPDATE entries SET content = ?, url = ? WHERE guid = 'hello'")
+        .bind(wrapped)
+        .bind("https://feeds.feedblitz.com/~/t/0/0/mr/~https://blog.example/hello")
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+
+    let rules = &t.state.link_rules;
+    assert_eq!(yesrss::links::reapply_if_changed(&t.state.db, rules).await.unwrap(), Some(1));
+    let (url, content): (String, String) = sqlx::query_as("SELECT url, content FROM entries WHERE guid = 'hello'")
+        .fetch_one(&t.state.db)
+        .await
+        .unwrap();
+    assert_eq!(url, "https://blog.example/hello");
+    assert!(content.contains(r#"href="https://example.org/paper""#), "{content}");
+    assert!(!content.contains("feedblitz"), "{content}");
+    assert_eq!(yesrss::links::reapply_if_changed(&t.state.db, rules).await.unwrap(), None);
+}
+
 mod atproto_flow {
     use std::sync::{Arc, Mutex};
 

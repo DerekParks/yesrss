@@ -10,6 +10,7 @@ pub mod error;
 pub mod feeds;
 pub mod fetch;
 pub mod greader;
+pub mod links;
 pub mod opml;
 pub mod parse;
 pub mod sanitize;

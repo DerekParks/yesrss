@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use ammonia::{Builder, UrlRelative};
 use url::Url;
 
+use crate::links::LinkRules;
+
 const EMBED_HOSTS: &[&str] = &[
     "www.youtube.com",
     "youtube.com",
@@ -12,8 +14,10 @@ const EMBED_HOSTS: &[&str] = &[
     "player.vimeo.com",
 ];
 
-pub fn clean_html(html: &str, base: Option<&Url>) -> String {
+pub fn clean_html(html: &str, base: Option<&Url>, links: &LinkRules) -> String {
+    let html = links.strip(html);
     let base = base.cloned();
+    let links = links.clone();
     let mut b = Builder::default();
     b.add_tags(["iframe", "video", "audio", "source", "picture"])
         .add_tag_attributes("img", ["srcset", "title"])
@@ -40,11 +44,12 @@ pub fn clean_html(html: &str, base: Option<&Url>) -> String {
         None => b.url_relative(UrlRelative::Deny),
     };
     b.attribute_filter(move |element, attribute, value| match (element, attribute) {
+        ("a", "href") => Some(links.unwrap_url(value).map_or(Cow::Borrowed(value), |u| Cow::Owned(u.into()))),
         ("iframe", "src") => embed_src(value, base.as_ref()).map(Cow::Owned),
         (_, "srcset") => clean_srcset(value, base.as_ref()).map(Cow::Owned),
         _ => Some(Cow::Borrowed(value)),
     });
-    b.clean(html).to_string()
+    b.clean(&html).to_string()
 }
 
 fn absolute_http(raw: &str, base: Option<&Url>) -> Option<Url> {
@@ -143,6 +148,7 @@ mod tests {
         let out = clean_html(
             r#"<p onclick="evil()">hi<script>alert(1)</script></p><img src=x onerror=alert(1)><a href="javascript:alert(1)">x</a><style>body{}</style>"#,
             Some(&base()),
+            &LinkRules::default(),
         );
         assert!(!out.contains("script"), "{out}");
         assert!(!out.contains("onclick"), "{out}");
@@ -153,7 +159,7 @@ mod tests {
 
     #[test]
     fn rewrites_relative_urls_and_hardens_links() {
-        let out = clean_html(r#"<a href="/about">a</a><img src="pic.png">"#, Some(&base()));
+        let out = clean_html(r#"<a href="/about">a</a><img src="pic.png">"#, Some(&base()), &LinkRules::default());
         assert!(out.contains(r#"href="https://blog.example.com/about""#), "{out}");
         assert!(out.contains(r#"src="https://blog.example.com/posts/pic.png""#), "{out}");
         assert!(out.contains(r#"target="_blank""#), "{out}");
@@ -163,10 +169,10 @@ mod tests {
 
     #[test]
     fn allows_only_known_iframes() {
-        let yt = clean_html(r#"<iframe src="https://www.youtube.com/embed/abc"></iframe>"#, None);
+        let yt = clean_html(r#"<iframe src="https://www.youtube.com/embed/abc"></iframe>"#, None, &LinkRules::default());
         assert!(yt.contains("youtube.com/embed/abc"), "{yt}");
         assert!(yt.contains("sandbox="), "{yt}");
-        let evil = clean_html(r#"<iframe src="https://evil.example/phish"></iframe>"#, None);
+        let evil = clean_html(r#"<iframe src="https://evil.example/phish"></iframe>"#, None, &LinkRules::default());
         assert!(!evil.contains("evil.example"), "{evil}");
     }
 
@@ -175,10 +181,20 @@ mod tests {
         let out = clean_html(
             r#"<img src="a.png" srcset="a.png 1x, javascript:alert(1) 2x, //cdn.example.com/b.png 3x">"#,
             Some(&base()),
+            &LinkRules::default(),
         );
         assert!(out.contains("https://blog.example.com/posts/a.png 1x"), "{out}");
         assert!(out.contains("https://cdn.example.com/b.png 3x"), "{out}");
         assert!(!out.contains("javascript"), "{out}");
+    }
+
+    #[test]
+    fn applies_link_rules() {
+        let html = r#"<p><a href="https://feeds.feedblitz.com/~/t/0/0/mr/~https://example.org/a?b=1&amp;c=2">a</a><a href="https://feeds.feedblitz.com/_/28/1/mr"><img src="https://assets.feedblitz.com/i/fblike20.png"></a></p>"#;
+        let out = clean_html(html, Some(&base()), &LinkRules::default());
+        assert!(out.contains(r#"href="https://example.org/a?b=1&amp;c=2""#), "{out}");
+        assert!(!out.contains("feedblitz"), "{out}");
+        assert_eq!(clean_html(&out, Some(&base()), &LinkRules::default()), out);
     }
 
     #[test]

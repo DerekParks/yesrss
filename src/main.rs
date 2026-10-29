@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use yesrss::config::Config;
 use yesrss::state::AppState;
-use yesrss::{auth, db, error, feeds, opml, scheduler, web};
+use yesrss::{auth, db, error, feeds, links, opml, scheduler, web};
 
 #[derive(Parser)]
 #[command(name = "yesrss", version, about = "A small, safe, self-hosted feed reader")]
@@ -88,6 +88,14 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("fetching from private networks is disabled (see --allow-private-networks)");
             }
             let state = AppState::new(db, cfg)?;
+            let st = state.clone();
+            tokio::spawn(async move {
+                match links::reapply_if_changed(&st.db, &st.link_rules).await {
+                    Ok(Some(n)) => tracing::info!("link rules changed; rewrote {n} stored entries"),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(error = ?e, "re-applying link rules failed"),
+                }
+            });
             scheduler::spawn(state.clone());
             let listener = tokio::net::TcpListener::bind(listen)
                 .await

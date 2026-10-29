@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use url::Url;
 
@@ -37,6 +38,10 @@ pub struct Config {
     /// Largest feed document accepted, in bytes.
     #[arg(long, env = "YESRSS_MAX_FEED_BYTES", default_value_t = 16 * 1024 * 1024)]
     pub max_feed_bytes: usize,
+
+    /// TOML file of extra link rules, in the format of the built-in `src/link_rules.toml`.
+    #[arg(long, env = "YESRSS_LINK_RULES")]
+    pub link_rules: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -50,6 +55,7 @@ impl Default for Config {
             fetch_concurrency: 8,
             public_url: None,
             max_feed_bytes: 16 * 1024 * 1024,
+            link_rules: None,
         }
     }
 }

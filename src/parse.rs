@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+
 use feed_rs::model::{Entry, Feed, Link, Text};
+use quick_xml::escape::{escape, unescape};
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::links::LinkRules;
 use crate::sanitize::{clean_html, clean_title, escape_html, html_to_text, text_to_html, truncate_chars};
 
 const SNIPPET_CHARS: usize = 300;
@@ -29,15 +35,89 @@ pub struct NewEntry {
     pub content_hash: String,
 }
 
-pub fn parse_feed(body: &[u8], source: &Url, now: i64) -> anyhow::Result<ParsedFeed> {
+pub fn parse_feed(body: &[u8], source: &Url, now: i64, links: &LinkRules) -> anyhow::Result<ParsedFeed> {
     let feed = feed_rs::parser::Builder::new()
         .base_uri(Some(source.as_str()))
         .build()
         .parse(body)?;
-    Ok(convert_feed(feed, source, now))
+    Ok(convert_feed(feed, source, now, &Context { links, orig_links: orig_links(body) }))
 }
 
-fn convert_feed(feed: Feed, source: &Url, now: i64) -> ParsedFeed {
+struct Context<'a> {
+    links: &'a LinkRules,
+    orig_links: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+enum ItemField {
+    Link,
+    OrigLink,
+}
+
+fn alternate_href(e: &BytesStart) -> Option<String> {
+    let attr = |name: &str| {
+        e.attributes()
+            .flatten()
+            .find(|a| a.key.as_ref() == name)
+            .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
+            .map(|v| v.trim().to_owned())
+    };
+    attr("href").filter(|_| attr("rel").is_none_or(|r| r == "alternate"))
+}
+
+/// Each item's `feedburner:origLink`, keyed by the item's own (redirecting) link.
+fn orig_links(body: &[u8]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    if !body.windows(8).any(|w| w == b"origLink") {
+        return found;
+    }
+    let Ok(xml) = std::str::from_utf8(body) else { return found };
+    let mut reader = Reader::from_str(xml);
+    let (mut in_item, mut link, mut orig) = (false, None::<String>, None::<String>);
+    let mut capture: Option<(ItemField, String)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                "item" | "entry" => (in_item, link, orig) = (true, None, None),
+                "link" if in_item && link.is_none() => match alternate_href(&e) {
+                    Some(href) => link = Some(href),
+                    None => capture = Some((ItemField::Link, String::new())),
+                },
+                "origLink" if in_item => capture = Some((ItemField::OrigLink, String::new())),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) if in_item && link.is_none() && e.local_name().as_ref() == "link" => {
+                link = alternate_href(&e);
+            }
+            Ok(Event::Text(t)) => capture.iter_mut().for_each(|(_, s)| s.push_str(&t)),
+            Ok(Event::GeneralRef(r)) => capture.iter_mut().for_each(|(_, s)| *s += &format!("&{};", &*r)),
+            Ok(Event::CData(c)) => capture.iter_mut().for_each(|(_, s)| s.push_str(&escape(&*c))),
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                "link" | "origLink" => {
+                    if let Some((field, raw)) = capture.take() {
+                        let value = unescape(&raw).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+                        match field {
+                            ItemField::Link => link = value,
+                            ItemField::OrigLink => orig = value,
+                        }
+                    }
+                }
+                "item" | "entry" => {
+                    if let (Some(l), Some(o)) = (link.take(), orig.take()) {
+                        found.insert(l, o);
+                    }
+                    in_item = false;
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    found
+}
+
+fn convert_feed(feed: Feed, source: &Url, now: i64, cx: &Context) -> ParsedFeed {
     let site_url = pick_link(&feed.links)
         .and_then(|href| source.join(href).ok())
         .filter(|u| matches!(u.scheme(), "http" | "https") && u != source)
@@ -52,7 +132,7 @@ fn convert_feed(feed: Feed, source: &Url, now: i64) -> ParsedFeed {
     let entries = feed
         .entries
         .into_iter()
-        .map(|e| convert_entry(e, source, now))
+        .map(|e| convert_entry(e, source, now, cx))
         .collect();
     ParsedFeed { title, site_url, entries }
 }
@@ -90,9 +170,11 @@ fn youtube_id(url: &Url) -> Option<String> {
     .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
 }
 
-fn convert_entry(e: Entry, source: &Url, now: i64) -> NewEntry {
+fn convert_entry(e: Entry, source: &Url, now: i64, cx: &Context) -> NewEntry {
     let url = pick_link(&e.links)
+        .map(|href| cx.orig_links.get(href.trim()).map_or(href, String::as_str))
         .and_then(|href| source.join(href).ok())
+        .map(|u| cx.links.unwrap_url(u.as_str()).unwrap_or(u))
         .filter(|u| matches!(u.scheme(), "http" | "https"));
     let base = url.as_ref().unwrap_or(source);
 
@@ -122,7 +204,7 @@ fn convert_entry(e: Entry, source: &Url, now: i64) -> NewEntry {
         raw_html = format!(r#"<p><img src="{}" alt=""></p>{raw_html}"#, escape_html(&thumb.image.uri));
     }
 
-    let content = clean_html(&raw_html, Some(base));
+    let content = clean_html(&raw_html, Some(base), cx.links);
     let text = html_to_text(&content);
     let title = e
         .title
@@ -215,7 +297,7 @@ mod tests {
 <enclosure url="https://example.com/ep1.mp3" type="audio/mpeg" length="1"/></item>
 <item><title>Future</title><guid>id-2</guid><pubDate>Tue, 10 Jun 2099 04:00:00 GMT</pubDate></item>
 </channel></rss>"#;
-        let f = parse_feed(xml, &src(), NOW).unwrap();
+        let f = parse_feed(xml, &src(), NOW, &LinkRules::default()).unwrap();
         assert_eq!(f.title, "Example & Co");
         assert_eq!(f.site_url.as_deref(), Some("https://example.com/"));
         assert_eq!(f.entries.len(), 2);
@@ -240,7 +322,7 @@ mod tests {
 <link rel="alternate" href="https://www.youtube.com/watch?v=abc_123"/>
 <author><name>Someone</name></author><published>2025-01-01T00:00:00Z</published>
 <media:group><media:title>Video</media:title><media:content url="https://www.youtube.com/v/abc_123" type="application/x-shockwave-flash" width="640" height="390"/><media:thumbnail url="https://i1.ytimg.com/vi/abc_123/hqdefault.jpg" width="480" height="360"/><media:description>Line one</media:description></media:group></entry></feed>"#;
-        let f = parse_feed(xml, &src(), NOW).unwrap();
+        let f = parse_feed(xml, &src(), NOW, &LinkRules::default()).unwrap();
         let e = &f.entries[0];
         assert_eq!(e.author.as_deref(), Some("Someone"));
         assert!(e.content.contains("youtube-nocookie.com/embed/abc_123"), "{}", e.content);
@@ -248,10 +330,42 @@ mod tests {
     }
 
     #[test]
+    fn prefers_orig_link_and_applies_link_rules() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:feedburner="http://rssnamespace.org/feedburner/ext/1.0"><channel><title>MR</title>
+<link>https://marginalrevolution.com</link>
+<item><feedburner:origLink>https://marginalrevolution.com/2026/10/a.html?utm_source=rss&amp;utm_medium=rss</feedburner:origLink>
+<title>A</title><link>https://feeds.feedblitz.com/~/972063845/0/marginalrevolution~A.html</link><guid isPermaLink="false">p1</guid>
+<description><![CDATA[<p>See <a href="https://feeds.feedblitz.com/~/t/0/0/marginalrevolution/~https://example.org/paper">this</a>.</p>
+<div><a title="Post to X.com" href="https://feeds.feedblitz.com/_/24/972063845/marginalrevolution"><img src="https://assets.feedblitz.com/i/x.png"></a></div>]]></description></item>
+<item><title>B</title><link>https://feeds.feedblitz.com/~/972063846/0/marginalrevolution~B.html</link><guid>p2</guid></item>
+</channel></rss>"#;
+        let f = parse_feed(xml, &src(), NOW, &LinkRules::default()).unwrap();
+        let (a, b) = (&f.entries[0], &f.entries[1]);
+        assert_eq!(a.url.as_deref(), Some("https://marginalrevolution.com/2026/10/a.html?utm_source=rss&utm_medium=rss"));
+        assert!(a.content.contains(r#"href="https://example.org/paper""#), "{}", a.content);
+        assert!(!a.content.contains("feedblitz"), "{}", a.content);
+        assert_eq!(b.url.as_deref(), Some("https://feeds.feedblitz.com/~/972063846/0/marginalrevolution~B.html"));
+    }
+
+    #[test]
+    fn reads_orig_link_from_atom() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:feedburner="http://rssnamespace.org/feedburner/ext/1.0">
+<title>F</title><link rel="alternate" href="https://example.com/"/>
+<entry><id>e1</id><title>E</title><updated>2025-01-01T00:00:00Z</updated>
+<link rel="replies" href="https://example.com/e1#comments"/>
+<link rel="alternate" type="text/html" href="https://feedproxy.example/~r/f/~3/abc/"/>
+<feedburner:origLink>https://example.com/e1</feedburner:origLink></entry></feed>"#;
+        let f = parse_feed(xml, &src(), NOW, &LinkRules::default()).unwrap();
+        assert_eq!(f.entries[0].url.as_deref(), Some("https://example.com/e1"));
+    }
+
+    #[test]
     fn parses_json_feed() {
         let json = br#"{"version":"https://jsonfeed.org/version/1.1","title":"JF",
 "items":[{"id":"1","content_text":"plain <text>","url":"https://example.com/p"}]}"#;
-        let f = parse_feed(json, &src(), NOW).unwrap();
+        let f = parse_feed(json, &src(), NOW, &LinkRules::default()).unwrap();
         assert_eq!(f.title, "JF");
         assert_eq!(f.entries[0].content, "<p>plain &lt;text&gt;</p>");
         assert_eq!(f.entries[0].title, "plain <text>");
@@ -259,6 +373,6 @@ mod tests {
 
     #[test]
     fn rejects_html() {
-        assert!(parse_feed(b"<!doctype html><html><body>hi</body></html>", &src(), NOW).is_err());
+        assert!(parse_feed(b"<!doctype html><html><body>hi</body></html>", &src(), NOW, &LinkRules::default()).is_err());
     }
 }

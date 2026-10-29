@@ -115,8 +115,23 @@ Every flag also reads an environment variable.
 | `--fetch-concurrency` | `YESRSS_FETCH_CONCURRENCY` | `8` | Parallel fetches |
 | `--public-url` | `YESRSS_PUBLIC_URL` | unset | Public HTTPS URL; enables Bluesky / atproto features |
 | `--max-feed-bytes` | `YESRSS_MAX_FEED_BYTES` | `16777216` | Largest accepted feed |
+| `--link-rules` | `YESRSS_LINK_RULES` | unset | TOML file of extra [link rules](#link-rules) |
 
 Logging uses `RUST_LOG` (default `info`).
+
+### Link rules
+
+Some feed services wrap every link in a click-tracking redirect, and not all of those redirects work:
+FeedBlitz sends some of its own wrapped links to a "fake link" page. yesrss rewrites links when it
+stores an item, using [`src/link_rules.toml`](src/link_rules.toml):
+
+- `[[unwrap]]` replaces a wrapper link with the URL it wraps (FeedBlitz, Outlook Safe Links).
+- `[[drop]]` removes links and images such as share buttons and tracking pixels.
+
+Items from FeedBurner-style feeds also link to `feedburner:origLink`, the article itself, rather than
+the redirect. To add rules without rebuilding, put them in a file of the same format and point
+`YESRSS_LINK_RULES` at it; they are added to the built-in set. When the rules change, the next start
+re-applies them to items already stored.
 
 ## User management
 
@@ -153,6 +168,7 @@ debug builds, so reload the browser to see changes).
 | --- | --- |
 | `src/fetch.rs` | HTTP client, SSRF guard, conditional GET |
 | `src/parse.rs`, `src/sanitize.rs` | Feed normalization and HTML sanitizing |
+| `src/links.rs`, `src/link_rules.toml` | Link unwrapping and stripping rules |
 | `src/feeds.rs`, `src/scheduler.rs` | Subscribe, discover, refresh, favicons, retention |
 | `src/entries.rs` | Entry queries shared by both APIs |
 | `src/api.rs` | JSON API for the web UI |
