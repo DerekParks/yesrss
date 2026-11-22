@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.98-bookworm AS build
+FROM docker.io/library/rust:1.100-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
